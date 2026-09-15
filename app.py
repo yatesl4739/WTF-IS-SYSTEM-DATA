@@ -170,6 +170,9 @@ class InspectorApp(tk.Tk):
         self.rows = []
         self.large_files = []
         self.scanning = False
+        self.deep_scanning = False
+        self.deep_cancel_event = threading.Event()
+        self.deep_current_path = None
         self._build()
         self.after(150, self._poll)
 
@@ -265,6 +268,123 @@ class InspectorApp(tk.Tk):
         self.snap_text.insert("1.0", "Run a scan to inspect local snapshots.\n")
         self.snap_text.configure(state="disabled")
 
+        # Deep Dive tab
+        deep_frame = ttk.Frame(self.nb, padding=10)
+        self.nb.add(deep_frame, text="Deep Dive")
+
+        # Path controls
+        deep_controls = ttk.Frame(deep_frame)
+        deep_controls.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(deep_controls, text="Directory:").pack(side="left")
+
+        self.deep_path_var = tk.StringVar()
+        self.deep_path_entry = ttk.Entry(
+            deep_controls,
+            textvariable=self.deep_path_var,
+            width=80
+        )
+        self.deep_path_entry.pack(side="left", fill="x", expand=True, padx=(8, 8))
+
+        ttk.Button(
+            deep_controls,
+            text="Browse",
+            command=self.browse_deep_directory
+        ).pack(side="left")
+
+        ttk.Button(
+            deep_controls,
+            text="Scan",
+            command=self.start_deep_scan
+        ).pack(side="left", padx=(8, 0))
+
+        ttk.Button(
+            deep_controls,
+            text="Up",
+            command=self.deep_go_up
+        ).pack(side="left", padx=(8, 0))
+
+        # Results tree
+        deep_cols = ("size", "name", "type", "path", "access")
+
+        self.deep_tree = ttk.Treeview(
+            deep_frame,
+            columns=deep_cols,
+            show="headings"
+        )
+
+        deep_headings = {
+            "size": "Allocated Size",
+            "name": "Name",
+            "type": "Type",
+            "path": "Path",
+            "access": "Access",
+        }
+
+        deep_widths = {
+            "size": 120,
+            "name": 250,
+            "type": 80,
+            "path": 600,
+            "access": 100,
+        }
+
+        for c in deep_cols:
+            self.deep_tree.heading(
+                c,
+                text=deep_headings[c],
+                command=lambda cc=c: self.sort_tree(
+                    self.deep_tree,
+                    cc,
+                    False
+                )
+            )
+
+            self.deep_tree.column(
+                c,
+                width=deep_widths[c],
+                anchor="w"
+            )
+
+        deep_ys = ttk.Scrollbar(
+            deep_frame,
+            orient="vertical",
+            command=self.deep_tree.yview
+        )
+
+        deep_xs = ttk.Scrollbar(
+            deep_frame,
+            orient="horizontal",
+            command=self.deep_tree.xview
+        )
+
+        self.deep_tree.configure(
+            yscrollcommand=deep_ys.set,
+            xscrollcommand=deep_xs.set
+        )
+
+        self.deep_tree.pack(
+            side="left",
+            fill="both",
+            expand=True
+        )
+
+        deep_ys.pack(
+            side="right",
+            fill="y"
+        )
+
+        # Double-click a directory to scan inside it
+        self.deep_tree.bind(
+            "<Double-1>",
+            self.deep_open_selected
+        )
+
+        # Press Return in the path box to scan
+        self.deep_path_entry.bind(
+            "<Return>",
+            lambda event: self.start_deep_scan()
+        )
         info = ttk.Label(
             outer,
             text="For the most complete result, grant this app full disk access System Settings → Privacy & Security → Full Disk Access. This app does not write anything to disks.",
@@ -359,6 +479,27 @@ class InspectorApp(tk.Tk):
                 elif kind == "cancelled":
                     self._finish("Scan cancelled")
                     self._populate_large_files()
+                elif kind == "deep_results":
+                    _, path, results = msg
+
+                    self._populate_deep_results(
+                        path,
+                        results
+                    )
+
+                elif kind == "deep_error":
+                    _, error = msg
+
+                    self.deep_scanning = False
+                    self.progress.stop()
+                    self.status.config(
+                        text="Deep scan failed"
+                    )
+
+                    messagebox.showerror(
+                        APP_NAME,
+                        error
+                    )
                 elif kind == "error":
                     self._finish("Scan failed")
                     messagebox.showerror(APP_NAME, msg[1])
@@ -417,6 +558,253 @@ class InspectorApp(tk.Tk):
             tree.move(iid, "", i)
         tree.heading(col, command=lambda: self.sort_tree(tree, col, not reverse))
 
+    def browse_deep_directory(self):
+        path = filedialog.askdirectory(
+            title="Choose a directory to inspect"
+        )
+
+        if not path:
+            return
+
+        self.deep_path_var.set(path)
+        self.start_deep_scan()
+
+
+    def start_deep_scan(self):
+        if self.deep_scanning:
+            return
+
+        raw_path = self.deep_path_var.get().strip()
+
+        if not raw_path:
+            messagebox.showinfo(
+                APP_NAME,
+                "Enter or choose a directory first."
+            )
+            return
+
+        path = expand(raw_path)
+
+        if not os.path.isdir(path):
+            messagebox.showerror(
+                APP_NAME,
+                "That directory does not exist."
+            )
+            return
+
+        self.deep_current_path = path
+        self.deep_path_var.set(path)
+
+        self.deep_scanning = True
+        self.deep_cancel_event.clear()
+
+        # Clear old results
+        for item in self.deep_tree.get_children():
+            self.deep_tree.delete(item)
+
+        self.status.config(
+            text=f"Inspecting {path}"
+        )
+
+        self.progress.start(10)
+
+        threading.Thread(
+            target=self._deep_scan_worker,
+            args=(path,),
+            daemon=True
+        ).start()
+
+
+    def _deep_scan_worker(self, path):
+        try:
+            results = []
+
+            with os.scandir(path) as entries:
+                for entry in entries:
+
+                    if self.deep_cancel_event.is_set():
+                        raise RuntimeError(
+                            "Deep scan cancelled"
+                        )
+
+                    # Do not follow symbolic links
+                    if entry.is_symlink():
+                        continue
+
+                    try:
+                        if entry.is_dir(
+                                follow_symlinks=False
+                        ):
+                            size, denied, _ = scan_tree(
+                                entry.path,
+                                self.deep_cancel_event,
+                                large_file_threshold=10**30
+                            )
+
+                            item_type = "Folder"
+
+                        elif entry.is_file(
+                                follow_symlinks=False
+                        ):
+                            st = entry.stat(
+                                follow_symlinks=False
+                            )
+
+                            size = allocated_size(st)
+                            denied = 0
+                            item_type = "File"
+
+                        else:
+                            continue
+
+                        results.append(
+                            (
+                                size,
+                                entry.name,
+                                item_type,
+                                entry.path,
+                                denied
+                            )
+                        )
+
+                    except (
+                            PermissionError,
+                            FileNotFoundError,
+                            OSError
+                    ):
+                        results.append(
+                            (
+                                0,
+                                entry.name,
+                                "Unknown",
+                                entry.path,
+                                1
+                            )
+                        )
+
+            # Biggest first
+            results.sort(
+                key=lambda x: x[0],
+                reverse=True
+            )
+
+            self.q.put(
+                (
+                    "deep_results",
+                    path,
+                    results
+                )
+            )
+
+        except RuntimeError as e:
+            self.q.put(
+                (
+                    "deep_error",
+                    str(e)
+                )
+            )
+
+        except Exception as e:
+            self.q.put(
+                (
+                    "deep_error",
+                    repr(e)
+                )
+            )
+
+
+    def _populate_deep_results(
+            self,
+            path,
+            results
+    ):
+        for item in self.deep_tree.get_children():
+            self.deep_tree.delete(item)
+
+        for (
+                size,
+                name,
+                item_type,
+                item_path,
+                denied
+        ) in results:
+
+            access = (
+                "OK"
+                if denied == 0
+                else f"{denied} skipped"
+            )
+
+            self.deep_tree.insert(
+                "",
+                "end",
+                values=(
+                    human_bytes(size),
+                    name,
+                    item_type,
+                    item_path,
+                    access
+                )
+            )
+
+        self.deep_current_path = path
+        self.deep_path_var.set(path)
+
+        self.deep_scanning = False
+        self.progress.stop()
+
+        self.status.config(
+            text=f"Deep scan complete: {path}"
+        )
+
+
+    def deep_open_selected(self, event=None):
+        sel = self.deep_tree.selection()
+
+        if not sel:
+            return
+
+        item = sel[0]
+
+        path = self.deep_tree.set(
+            item,
+            "path"
+        )
+
+        item_type = self.deep_tree.set(
+            item,
+            "type"
+        )
+
+        if item_type == "Folder":
+            self.deep_path_var.set(path)
+            self.start_deep_scan()
+
+        else:
+            subprocess.Popen(
+                [
+                    "/usr/bin/open",
+                    "-R",
+                    path
+                ]
+            )
+
+
+    def deep_go_up(self):
+        if not self.deep_current_path:
+            return
+
+        parent = os.path.dirname(
+            self.deep_current_path
+        )
+
+        # Already at filesystem root
+        if parent == self.deep_current_path:
+            return
+
+        self.deep_path_var.set(parent)
+        self.start_deep_scan()
+
     def reveal_selected(self):
         current_tab = self.nb.index(self.nb.select())
 
@@ -428,6 +816,9 @@ class InspectorApp(tk.Tk):
             path_col = "path"
         elif current_tab == 2:
             tree = self.file_tree
+            path_col = "path"
+        elif current_tab == 4:
+            tree = self.deep_tree
             path_col = "path"
         else:
             messagebox.showinfo(APP_NAME, "There is nothing to reveal on this tab.")
